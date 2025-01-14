@@ -40,9 +40,7 @@ const val ZOWE_CONFIG_NAME = "zowe.config.json"
  */
 fun showNotificationForAddUpdateZoweConfigIfNeeded(project: Project, type: ZoweConfigType) {
   val zoweConfigService = ZoweConfigService.getInstance(project)
-  val zoweConfigState = zoweConfigService.getZoweConfigState(type = type)
-
-  if (zoweConfigState == ZoweConfigState.NEED_TO_ADD) {
+  if (zoweConfigService.findAllZosmfExistingConnection(type).isEmpty()) {
     val topic = if (type == ZoweConfigType.LOCAL)
       LOCAL_ZOWE_CONFIG_CHANGED
     else
@@ -61,7 +59,7 @@ fun showNotificationForAddUpdateZoweConfigIfNeeded(project: Project, type: ZoweC
         addAction(object : DumbAwareAction("Add $type Zowe Connection") {
           override fun actionPerformed(e: AnActionEvent) {
             ZoweConfigService.getInstance(project)
-              .addOrUpdateZoweConfig(false, true, type)
+              .addOrUpdateZoweConfig(true, true, type)
             hideBalloon()
           }
         }).notify(project)
@@ -76,8 +74,7 @@ fun showNotificationForAddUpdateZoweConfigIfNeeded(project: Project, type: ZoweC
  */
 fun showDialogForDeleteZoweConfigIfNeeded(project: Project, type: ZoweConfigType) {
   val zoweConfigService = ZoweConfigService.getInstance(project)
-  val zoweConfigState = zoweConfigService.getZoweConfigState(type = type)
-  if (zoweConfigState != ZoweConfigState.NEED_TO_ADD && zoweConfigState != ZoweConfigState.NOT_EXISTS) {
+  if (zoweConfigService.findAllZosmfExistingConnection(type).isNotEmpty()) {
     val choice = Messages.showDialog(
       project,
       "$type Zowe config file has been deleted.\n" +
