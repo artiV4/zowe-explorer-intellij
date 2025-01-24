@@ -18,6 +18,7 @@ import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.application.runWriteAction
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
@@ -316,6 +317,82 @@ class ZoweConfigServiceTestSpec : WithApplicationShouldSpec({
         assertSoftly { addOrUpdateCalledCount shouldBe 1 }
       }
 
+      should("cancel testing Zowe config connections") {
+        val testFailProfileName5 = "test_profile_name_fail5"
+        var extractSecurePropertiesCalledCount = 0
+        var cancelationCount = 0
+
+        dataOpsManagerServiceMock.testInstance = object : TestDataOpsManagerImpl() {
+          override fun <R : Any> performOperation(operation: Operation<R>, progressIndicator: ProgressIndicator): R {
+            return when (operation) {
+              is InfoOperation -> {
+                infoOperationCount += 1
+                println("!!!")
+                println((operation as InfoOperation).connectionConfig.uuid)
+                if ((operation as InfoOperation).connectionConfig.uuid==("throw")){
+                  cancelationCount += 1
+                  throw ProcessCanceledException()
+                }
+                else {
+                  mockk<SystemsResponse>() as R
+                }
+              }
+              else -> {
+                mockk<Any>() as R
+              }
+            }
+          }
+        }
+
+        val globalZoweConfig: ZoweConfig = mockk {
+          every {
+            extractSecureProperties(any<Array<String>>(), any<KeytarWrapper>())
+          } answers {
+            extractSecurePropertiesCalledCount += 1
+          }
+          every {
+            getListOfZosmfConections()
+          } returns listOf(
+            mockk {
+              every { user } returns "TSTUSR"
+              every { password } returns "TSTPWD"
+              every { profileName } returns testFailProfileName5
+              every { basePath } returns "test/base/path/"
+              every { host } returns "testFailHost5"
+              every { zosmfPort } returns "1234"
+              every { protocol } returns "https"
+              every { rejectUnauthorized } returns null
+            }
+          )
+        }
+
+        every { parseConfigJsonRef(any<InputStream>()) } returns globalZoweConfig
+
+        every {
+          configServiceCrudableMock.find(any<Class<out ConnectionConfig>>(), any<Predicate<in ConnectionConfig>>())
+        } answers {
+          listOf<ConnectionConfig>(
+            mockk {
+              every { uuid } returns "throw"
+              every { zVersion } returns ZVersion.ZOS_2_4
+              every { name } returns "$ZOWE_PROJECT_PREFIX${ZoweConfigType.GLOBAL}-$testFailProfileName5"
+              every { zoweConfigPath } returns System.getProperty("user.home").replace("((\\*)|(/*))$", "") + "/.zowe/" + ZOWE_CONFIG_NAME
+            }
+          )
+            .filter(secondArg<Predicate<ConnectionConfig>>()::test)
+            .stream()
+        }
+
+        val zoweConfigService = ZoweConfigServiceImpl(projectMock)
+
+        zoweConfigService
+          .addOrUpdateZoweConfig(scanProject = true, checkConnection = true, ZoweConfigType.GLOBAL)
+        assertSoftly { cancelationCount shouldBe 1 }
+        assertSoftly { setCredentialsCalledCount shouldBe 1 }
+        assertSoftly { infoOperationCount shouldBe 1 }
+
+      }
+
       should("add a new connection for the local Zowe config, scanning a project, with failed connections and their check") {
         val testSuccessProfileName = "test_profile_name_success"
         val testFailProfileName1 = "test_profile_name_fail1"
@@ -543,6 +620,7 @@ class ZoweConfigServiceTestSpec : WithApplicationShouldSpec({
         val testFailProfileName2 = "test_profile_name_fail2"
         val testFailProfileName3 = "test_profile_name_fail3"
         val testFailProfileName4 = "test_profile_name_fail4"
+        val testFailProfileName5 = "test_profile_name_fail5"
         val testFailHost1 = "test1.com"
         val testFailHost2 = "test2.com"
         val testFailHost3 = "test3.com"

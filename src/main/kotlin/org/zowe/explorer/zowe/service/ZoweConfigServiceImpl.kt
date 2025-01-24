@@ -20,10 +20,14 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.application.runWriteAction
 import com.intellij.openapi.components.service
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.VirtualFileManager
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import org.zowe.explorer.config.ConfigService
 import org.zowe.explorer.config.connect.ConnectionConfig
 import org.zowe.explorer.config.connect.CredentialService
@@ -180,7 +184,7 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
         }
       }
     } catch (e: Exception) {
-      NotificationsService.errorNotification(e, project = myProject, custTitle="Error with Zowe config file")
+      NotificationsService.errorNotification(e, project = myProject, custTitle = "Error with Zowe config file")
       return null
     }
   }
@@ -239,42 +243,97 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
   }
 
   /**
-   * Checks the zowe connection using InfoOperation. It is also needed to load zos version and
+   * Checks the zowe connections using InfoOperation. It is also needed to load zos version and
    * real owner of the connection (acceptable for alias users).
    * IMPORTANT!!! It modifies passed connection object by setting zVersion and owner.
-   * @param zoweConnection connection to check and prepare.
-   * @throws Throwable if something went wrong (connection was not established or one of requests was failed ...)
+   * @param zoweConnections list of connection to check and prepare.
+   * @param type of zowe config
+   * @throws ProcessCanceledException if connection has been canceled by user
    */
-  private fun testAndPrepareConnection(zoweConnection: ConnectionConfig) {
-    val throwable = runTask("Testing Connection to ${zoweConnection.url}", myProject) { indicator ->
-      return@runTask try {
-        runCatching {
-          DataOpsManager.getService().performOperation(InfoOperation(zoweConnection), indicator)
-        }.onSuccess {
-          indicator.text = "Retrieving z/OS information"
-          val systemInfo = DataOpsManager.getService().performOperation(ZOSInfoOperation(zoweConnection), indicator)
-          zoweConnection.zVersion = when (systemInfo.zosVersion) {
-            "04.25.00" -> ZVersion.ZOS_2_2
-            "04.26.00" -> ZVersion.ZOS_2_3
-            "04.27.00" -> ZVersion.ZOS_2_4
-            "04.28.00" -> ZVersion.ZOS_2_5
-            "04.29.00" -> ZVersion.ZOS_3_1
-            else -> ZVersion.ZOS_2_1
+  @Throws(ProcessCanceledException::class)
+  private fun testAndPrepareConnections(
+    zoweConnections: List<ZOSConnection>,
+    type: ZoweConfigType
+  ): Pair<MutableList<ConnectionConfig>, MutableList<ConnectionConfig>> {
+    val goodConnections = mutableListOf<ConnectionConfig>()
+    val failedConnections = mutableListOf<ConnectionConfig>()
+    val results = mutableListOf<Deferred<ConnectionConfig>>()
+    var throwable: ProcessCanceledException? = null
+    runTask("Testing Connections...", myProject, cancellable = true) { indicator ->
+      runBlocking {
+        for (zosmfConnection in zoweConnections) {
+          results.add(async {
+            val zoweConnection: ConnectionConfig = prepareConnection(zosmfConnection, type)
+            try {
+              runCatching {
+                if (!indicator.isCanceled) {
+                  indicator.text = if (zoweConnections.size == 1)
+                    "Testing Connection to ${zoweConnection.url}"
+                  else
+                    "Testing Connection to ${zoweConnections.size} connections"
+                  service<DataOpsManager>().performOperation(InfoOperation(zoweConnection), indicator)
+                } else {
+                  throw ProcessCanceledException()
+                }
+              }.onSuccess {
+                if (!indicator.isCanceled) {
+
+                  indicator.text = if (zoweConnections.size == 1)
+                    "Retrieving z/OS information for ${zoweConnection.url}"
+                  else
+                    "Retrieving z/OS information for ${zoweConnections.size} connections"
+                  val systemInfo =
+                    service<DataOpsManager>().performOperation(
+                      ZOSInfoOperation(zoweConnection),
+                      indicator
+                    )
+                  zoweConnection.zVersion = when (systemInfo.zosVersion) {
+                    "04.25.00" -> ZVersion.ZOS_2_2
+                    "04.26.00" -> ZVersion.ZOS_2_3
+                    "04.27.00" -> ZVersion.ZOS_2_4
+                    "04.28.00" -> ZVersion.ZOS_2_5
+                    else -> ZVersion.ZOS_2_1
+                  }
+                } else {
+                  throw ProcessCanceledException()
+                }
+              }.onSuccess {
+                if (!indicator.isCanceled) {
+                  indicator.text = if (zoweConnections.size == 1)
+                    "Retrieving user information for ${zoweConnection.url}"
+                  else
+                    "Retrieving user information for ${zoweConnections.size} connections"
+                  zoweConnection.owner = whoAmI(zoweConnection) ?: ""
+                } else {
+                  throw ProcessCanceledException()
+                }
+              }.onFailure {
+                if (indicator.isCanceled)
+                  throw ProcessCanceledException()
+                else {
+                  throw it
+                }
+              }
+            } catch (t: Throwable) {
+              if (t is ProcessCanceledException)
+                throwable = t
+              failedConnections.add(zoweConnection)
+              return@async zoweConnection
+            }
+            goodConnections.add(zoweConnection)
+            return@async zoweConnection
           }
-        }.onSuccess {
-          indicator.text = "Retrieving user information"
-          zoweConnection.owner = whoAmI(zoweConnection) ?: ""
-        }.onFailure {
-          throw it
+          )
         }
-        null
-      } catch (t: Throwable) {
-        t
       }
     }
     if (throwable != null) {
-      throw throwable
+      throw ProcessCanceledException()
     }
+    runBlocking {
+      results.map { it.await() }
+    }
+    return goodConnections to failedConnections
   }
 
   /**
@@ -290,7 +349,10 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
         this.globalZoweConfig
       zoweConfig ?: throw Exception("Cannot get $type Zowe config")
 
-      val (allPreparedConn, failedConnections) = testAndPrepareAllZosmfConnections(zoweConfig, type)
+      val (goodConnections, failedConnections) = testAndPrepareConnections(
+        zoweConfig.getListOfZosmfConections(),
+        type
+      )
       if (checkConnection and failedConnections.isNotEmpty()) {
         val andMore = if (failedConnections.size > 3) "..." else ""
         notifyUiOnConnectionFailure(
@@ -300,9 +362,9 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
         )
       }
       val conToAdd = if (checkConnection)
-        allPreparedConn.subtract(failedConnections.toSet())
+        goodConnections
       else
-        allPreparedConn
+        goodConnections + failedConnections
       conToAdd.forEach { zosmfConnection ->
         val connectionOpt = configCrudable.addOrUpdate(zosmfConnection)
         if (!connectionOpt.isEmpty) {
@@ -315,7 +377,14 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
       }
 
     } catch (e: Exception) {
-      NotificationsService.errorNotification(e, project = myProject, custTitle="Error with Zowe config file")
+      if (e !is ProcessCanceledException)
+        NotificationsService.errorNotification(
+          e,
+          project = myProject,
+          custTitle = "Error with Zowe config file"
+        )
+      else { /* Nothing to do */
+      }
     }
   }
 
@@ -336,31 +405,6 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
       ?: zosmfConnection.toConnectionConfig(UUID.randomUUID().toString(), type = type)
     CredentialService.getService().setCredentials(zoweConnection.uuid, username, password.toCharArray())
     return zoweConnection
-  }
-
-  /**
-   * Convert all zosmf connections from zowe config file to ConnectionConfig and tests them
-   * @param zoweConfig
-   * @param type of zowe config
-   * @return pair of lists, one is the connections list, the second is the list of URLs which did not pass the test
-   */
-  private fun testAndPrepareAllZosmfConnections(
-    zoweConfig: ZoweConfig,
-    type: ZoweConfigType
-  ): Pair<List<ConnectionConfig>, List<ConnectionConfig>> {
-    return zoweConfig.getListOfZosmfConections()
-      .fold(
-        mutableListOf<ConnectionConfig>() to mutableListOf<ConnectionConfig>()
-      ) { (allConnectionConfigs, failedURLs), zosmfConnection ->
-        val zoweConnection = prepareConnection(zosmfConnection, type)
-        try {
-          testAndPrepareConnection(zoweConnection)
-        } catch (t: Throwable) {
-          failedURLs.add(zoweConnection)
-        }
-        allConnectionConfigs.add(zoweConnection)
-        allConnectionConfigs to failedURLs
-      }
   }
 
   /**
@@ -398,7 +442,7 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
       }
 
     } catch (e: Exception) {
-      NotificationsService.errorNotification(e, project = myProject, custTitle="Error with Zowe config file")
+      NotificationsService.errorNotification(e, project = myProject, custTitle = "Error with Zowe config file")
     }
   }
 
@@ -421,13 +465,13 @@ class ZoweConfigServiceImpl(override val myProject: Project) : ZoweConfigService
     var host = "localhost"
     var port = "10443"
     if (matcher.matches()) {
-      if (matcher.group(2) != null)
+      if (!matcher.group(2).isNullOrBlank())
         host = matcher.group(2)
-      if (matcher.group(3) != null)
+      if (!matcher.group(3).isNullOrBlank())
         port = matcher.group(3).substring(1)
     }
 
-    val content = getResourceAsStreamWrappable(ZoweConfigServiceImpl::class.java.classLoader ,"files/${ZOWE_CONFIG_NAME}")
+    val content = getResourceAsStreamWrappable(ZoweConfigServiceImpl::class.java.classLoader, "files/${ZOWE_CONFIG_NAME}")
       .use { iS -> iS?.readAllBytes()?.let { String(it, charset) } }
       ?.replace("<PORT>".toRegex(), port)
       ?.replace("<HOST>".toRegex(), "\"$host\"")
